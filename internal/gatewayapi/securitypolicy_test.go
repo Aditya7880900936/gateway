@@ -1635,7 +1635,7 @@ func SetRouteParentContext(route RouteContext, parentRef gwapiv1.ParentReference
 	route.SetRouteParentContext(parentRef, ctx)
 }
 
-// --- TCP branch: validateSecurityPolicyForTCP(...) returns err -> SetTranslationErrorForPolicyAncestors(...) + return
+// --- L4 branch: validateSecurityPolicyForL4(...) returns err -> SetTranslationErrorForPolicyAncestors(...) + return
 func Test_SecurityPolicy_TCP_Invalid_setsStatus_and_returns(t *testing.T) {
 	tr := &Translator{GatewayControllerName: "gateway.envoyproxy.io/gatewayclass-controller"}
 	trContext := &TranslatorContext{}
@@ -1818,7 +1818,9 @@ func Test_SecurityPolicy_TCPRoute_UnsupportedAllow_setsWarning(t *testing.T) {
 	}
 
 	resources := resource.NewResources()
-	tcpRouteIR := &ir.TCPRoute{Name: "tcp-route"}
+	tcpRouteIR := &ir.TCPRoute{
+		Name: irTCPRouteName(tcpRoute),
+	}
 	xdsIR := resource.XdsIRMap{
 		tr.getIRKey(gateway): &ir.Xds{
 			TCP: []*ir.TCPListener{
@@ -1987,7 +1989,9 @@ func Test_SecurityPolicy_TCPRoute_MergedUnsupportedAllowWithoutParent_setsWarnin
 	}
 
 	resources := resource.NewResources()
-	tcpRouteIR := &ir.TCPRoute{Name: "tcp-route"}
+	tcpRouteIR := &ir.TCPRoute{
+		Name: irTCPRouteName(tcpRoute),
+	}
 	xdsIR := resource.XdsIRMap{
 		tr.getIRKey(gateway): &ir.Xds{
 			TCP: []*ir.TCPListener{
@@ -2018,6 +2022,10 @@ func Test_SecurityPolicy_TCPRoute_MergedUnsupportedAllowWithoutParent_setsWarnin
 		policy,
 		target,
 	)
+
+	t.Logf("route IR name: %q", tcpRouteIR.Name)
+	t.Logf("expected route name: %q", irTCPRouteName(tcpRoute))
+	t.Logf("parent context: %+v", tcpRoute.GetRouteParentContext(tcpRoute.Spec.ParentRefs[0]))
 
 	require.NotNil(t, tcpRouteIR.Authorization)
 	require.Len(t, tcpRouteIR.Authorization.Rules, 1)
@@ -2147,7 +2155,9 @@ func Test_SecurityPolicy_TCPRoute_MergedUnsupportedDeny_setsErrorOnParent(t *tes
 	}
 
 	resources := resource.NewResources()
-	tcpRouteIR := &ir.TCPRoute{Name: "tcp-route"}
+	tcpRouteIR := &ir.TCPRoute{
+		Name: irTCPRouteName(tcpRoute),
+	}
 	xdsIR := resource.XdsIRMap{
 		tr.getIRKey(gateway): &ir.Xds{
 			TCP: []*ir.TCPListener{
@@ -2315,7 +2325,9 @@ func Test_SecurityPolicy_TCPRoute_MergedUnsupportedDeny_OverriddenByRoute(t *tes
 	}
 
 	resources := resource.NewResources()
-	tcpRouteIR := &ir.TCPRoute{Name: "tcp-route"}
+	tcpRouteIR := &ir.TCPRoute{
+		Name: irTCPRouteName(tcpRoute),
+	}
 	xdsIR := resource.XdsIRMap{
 		tr.getIRKey(gateway): &ir.Xds{
 			TCP: []*ir.TCPListener{
@@ -2462,7 +2474,7 @@ func Test_SecurityPolicy_HTTP_Invalid_setsStatus_and_returns(t *testing.T) {
 	require.True(t, hasParentFalseCondition(policy))
 }
 
-func Test_validateSecurityPolicyForTCP_Table(t *testing.T) {
+func Test_validateSecurityPolicyForL4_Table(t *testing.T) {
 	tests := []struct {
 		name    string
 		spec    egv1a1.SecurityPolicySpec
@@ -2534,6 +2546,44 @@ func Test_validateSecurityPolicyForTCP_Table(t *testing.T) {
 							Action: egv1a1.AuthorizationActionDeny,
 							Principal: &egv1a1.Principal{
 								ClientCIDRs: []egv1a1.CIDR{"10.0.0.0/99"},
+							},
+						},
+					},
+				},
+			},
+			wantErr: true,
+		},
+		{
+			// The L4 matcher only looks at client CIDRs, so accepting an operation
+			// would silently widen the rule to all traffic from those CIDRs.
+			name: "operation with methods is rejected",
+			spec: egv1a1.SecurityPolicySpec{
+				Authorization: &egv1a1.Authorization{
+					Rules: []egv1a1.AuthorizationRule{
+						{
+							Action:    egv1a1.AuthorizationActionAllow,
+							Operation: &egv1a1.Operation{Methods: []gwapiv1.HTTPMethod{gwapiv1.HTTPMethodGet}},
+							Principal: &egv1a1.Principal{
+								ClientCIDRs: []egv1a1.CIDR{"10.0.0.0/8"},
+							},
+						},
+					},
+				},
+			},
+			wantErr: true,
+		},
+		{
+			name: "operation with path is rejected",
+			spec: egv1a1.SecurityPolicySpec{
+				Authorization: &egv1a1.Authorization{
+					Rules: []egv1a1.AuthorizationRule{
+						{
+							Action: egv1a1.AuthorizationActionAllow,
+							Operation: &egv1a1.Operation{Path: &egv1a1.PathMatch{
+								Value: "/admin",
+							}},
+							Principal: &egv1a1.Principal{
+								ClientCIDRs: []egv1a1.CIDR{"10.0.0.0/8"},
 							},
 						},
 					},
@@ -2624,7 +2674,7 @@ func Test_validateSecurityPolicyForTCP_Table(t *testing.T) {
 					},
 				},
 			},
-			wantErr: false,
+			wantErr: true,
 		},
 		{
 			name: "mixed allow and deny ok",
@@ -2648,17 +2698,36 @@ func Test_validateSecurityPolicyForTCP_Table(t *testing.T) {
 		},
 	}
 
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			p := &egv1a1.SecurityPolicy{Spec: tc.spec}
-			err := validateSecurityPolicyForTCP(p)
-			if tc.wantErr {
-				require.Error(t, err)
-			} else {
-				require.NoError(t, err)
-			}
-		})
+	// TCP and UDP share the same rules, so every case must hold for both.
+	for _, proto := range []string{"TCP", "UDP"} {
+		for _, tc := range tests {
+			t.Run(proto+"/"+tc.name, func(t *testing.T) {
+				p := &egv1a1.SecurityPolicy{Spec: tc.spec}
+				err := validateSecurityPolicyForL4(p, proto)
+				if tc.wantErr {
+					require.Error(t, err)
+				} else {
+					require.NoError(t, err)
+				}
+			})
+		}
 	}
+
+	// Rejections that are about the protocol rather than the input name it, so the
+	// status condition tells the user which listener protocol refused the field.
+	t.Run("protocol named in protocol-specific errors", func(t *testing.T) {
+		p := &egv1a1.SecurityPolicy{Spec: egv1a1.SecurityPolicySpec{
+			Authorization: &egv1a1.Authorization{
+				Rules: []egv1a1.AuthorizationRule{{
+					Action:    egv1a1.AuthorizationActionAllow,
+					Principal: &egv1a1.Principal{Headers: []egv1a1.AuthorizationHeaderMatch{{Name: "x-user", Values: []string{"foo"}}}},
+				}},
+			},
+		}}
+
+		require.ErrorContains(t, validateSecurityPolicyForL4(p, "TCP"), "headers not supported for TCP")
+		require.ErrorContains(t, validateSecurityPolicyForL4(p, "UDP"), "headers not supported for UDP")
+	})
 }
 
 func Test_validateAuthorizationGeoIPForHTTP(t *testing.T) {
@@ -3558,7 +3627,7 @@ func TestFilterAuthorizationForTCP(t *testing.T) {
 	require.Equal(t, "allow-cidr", *policy.Spec.Authorization.Rules[0].Name)
 	require.Equal(t, "deny-headers", *policy.Spec.Authorization.Rules[1].Name)
 
-	require.NoError(t, validateSecurityPolicyForTCP(&egv1a1.SecurityPolicy{
+	require.NoError(t, validateSecurityPolicyForL4(&egv1a1.SecurityPolicy{
 		Spec: egv1a1.SecurityPolicySpec{
 			Authorization: &egv1a1.Authorization{
 				Rules: []egv1a1.AuthorizationRule{
@@ -3566,9 +3635,9 @@ func TestFilterAuthorizationForTCP(t *testing.T) {
 				},
 			},
 		},
-	}))
+	}, "TCP"))
 
-	require.Error(t, validateSecurityPolicyForTCP(&egv1a1.SecurityPolicy{
+	require.Error(t, validateSecurityPolicyForL4(&egv1a1.SecurityPolicy{
 		Spec: egv1a1.SecurityPolicySpec{
 			Authorization: &egv1a1.Authorization{
 				Rules: []egv1a1.AuthorizationRule{
@@ -3576,7 +3645,7 @@ func TestFilterAuthorizationForTCP(t *testing.T) {
 				},
 			},
 		},
-	}))
+	}, "TCP"))
 }
 
 func TestFilterAuthorizationForTCP_UnsupportedAllowRule(t *testing.T) {
